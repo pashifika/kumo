@@ -80,6 +80,17 @@ type Storage interface {
 
 	PutBucketLogging(ctx context.Context, bucket string, cfg BucketLoggingConfig) error
 	GetBucketLogging(ctx context.Context, bucket string) (*BucketLoggingConfig, error)
+
+	// Bucket website / lifecycle / object restore.
+	PutBucketWebsite(ctx context.Context, bucket string, cfg *WebsiteConfiguration) error
+	GetBucketWebsite(ctx context.Context, bucket string) (*WebsiteConfiguration, error)
+	DeleteBucketWebsite(ctx context.Context, bucket string) error
+
+	PutBucketLifecycle(ctx context.Context, bucket string, cfg *LifecycleConfiguration) error
+	GetBucketLifecycle(ctx context.Context, bucket string) (*LifecycleConfiguration, error)
+	DeleteBucketLifecycle(ctx context.Context, bucket string) error
+
+	PutObjectRestore(ctx context.Context, bucket, key string, state *RestoreState) (bool, error)
 }
 
 // Option is a configuration option for MemoryStorage.
@@ -121,6 +132,9 @@ type MemoryBucket struct {
 	Policy             string                      `json:"policy,omitempty"`            // bucket policy JSON document (empty == not configured)
 	Logging            *BucketLoggingConfig        `json:"logging,omitempty"`           // server access logging target (nil == disabled)
 	ObjectACLs         map[string]*ObjectACL       `json:"objectAcls,omitempty"`        // per-object ACL (key -> ACL)
+	Website            *WebsiteConfiguration       `json:"website,omitempty"`           // static-site-hosting configuration
+	Lifecycle          *LifecycleConfiguration     `json:"lifecycle,omitempty"`         // expiration / transition rules
+	ObjectRestores     map[string]*RestoreState    `json:"objectRestores,omitempty"`    // per-object restore state (key -> state)
 }
 
 // BucketLoggingConfig stores the destination for server access logs.

@@ -106,6 +106,8 @@ func (s *Service) HandleCORSPreflight(w http.ResponseWriter, r *http.Request) {
 // Route Dispatchers - dispatch based on query parameters
 
 // handleBucketGet dispatches GET /{bucket} requests based on query parameters.
+//
+//nolint:funlen // It's a straightforward dispatch, and splitting it up would just add indirection.
 func (s *Service) handleBucketGet(w http.ResponseWriter, r *http.Request) {
 	if _, ok := r.URL.Query()["versioning"]; ok {
 		s.GetBucketVersioning(w, r)
@@ -145,6 +147,18 @@ func (s *Service) handleBucketGet(w http.ResponseWriter, r *http.Request) {
 
 	if _, ok := r.URL.Query()["uploads"]; ok {
 		s.ListMultipartUploads(w, r)
+
+		return
+	}
+
+	if _, ok := r.URL.Query()["website"]; ok {
+		s.GetBucketWebsite(w, r)
+
+		return
+	}
+
+	if _, ok := r.URL.Query()["lifecycle"]; ok {
+		s.GetBucketLifecycleConfiguration(w, r)
 
 		return
 	}
@@ -207,9 +221,7 @@ func (s *Service) serveBucketSubresourceStub(w http.ResponseWriter, r *http.Requ
 func bucketSubresourceErrorCode(q map[string][]string) (string, bool) {
 	mapping := map[string]string{
 		"cors":              "NoSuchCORSConfiguration",
-		"lifecycle":         "NoSuchLifecycleConfiguration",
 		"replication":       "ReplicationConfigurationNotFoundError",
-		"website":           "NoSuchWebsiteConfiguration",
 		"tagging":           "NoSuchTagSet",
 		"object-lock":       "ObjectLockConfigurationNotFoundError",
 		"ownershipControls": "OwnershipControlsNotFoundError",
@@ -367,6 +379,12 @@ func (s *Service) handleObjectPost(w http.ResponseWriter, r *http.Request) {
 
 	if r.URL.Query().Get("uploadId") != "" {
 		s.CompleteMultipartUpload(w, r)
+
+		return
+	}
+
+	if _, ok := r.URL.Query()["restore"]; ok {
+		s.RestoreObject(w, r)
 
 		return
 	}
@@ -1422,6 +1440,18 @@ func (s *Service) handleBucketPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if _, ok := r.URL.Query()["website"]; ok {
+		s.PutBucketWebsite(w, r)
+
+		return
+	}
+
+	if _, ok := r.URL.Query()["lifecycle"]; ok {
+		s.PutBucketLifecycleConfiguration(w, r)
+
+		return
+	}
+
 	s.CreateBucket(w, r)
 }
 
@@ -1441,6 +1471,18 @@ func (s *Service) handleBucketDelete(w http.ResponseWriter, r *http.Request) {
 
 	if _, ok := r.URL.Query()["policy"]; ok {
 		s.DeleteBucketPolicy(w, r)
+
+		return
+	}
+
+	if _, ok := r.URL.Query()["website"]; ok {
+		s.DeleteBucketWebsite(w, r)
+
+		return
+	}
+
+	if _, ok := r.URL.Query()["lifecycle"]; ok {
+		s.DeleteBucketLifecycle(w, r)
 
 		return
 	}
