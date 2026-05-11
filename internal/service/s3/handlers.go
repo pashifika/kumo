@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -792,6 +793,14 @@ func (s *Service) CopyObject(w http.ResponseWriter, r *http.Request) {
 // parseCopySource parses the X-Amz-Copy-Source header value.
 // Format: /bucket/key or bucket/key (URL-encoded).
 func parseCopySource(source string) (bucket, key string) {
+	// AWS accepts both plain ("bucket/key") and URL-encoded
+	// ("bucket%2Fkey") forms. Decode first so a single split handles
+	// both. PathUnescape (not QueryUnescape) preserves '+' which is a
+	// valid S3 key character.
+	if decoded, err := url.PathUnescape(source); err == nil {
+		source = decoded
+	}
+
 	source = strings.TrimPrefix(source, "/")
 
 	idx := strings.IndexByte(source, '/')

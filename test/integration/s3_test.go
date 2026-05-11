@@ -7,6 +7,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -1336,6 +1337,63 @@ func TestS3_CopyObject(t *testing.T) {
 		"ETag", "LastModified", "ResultMetadata",
 		"ServerSideEncryption", "CopySourceVersionId",
 	)).Assert(t.Name(), copyOutput)
+}
+
+// TestS3_CopyObject_URLEncodedSource verifies that the URL-encoded
+// form of x-amz-copy-source is accepted, matching AWS S3 behavior.
+// Some AWS Go SDK callers escape the entire "bucket/key" string with
+// url.PathEscape to be safe with keys containing '/', '+', or spaces.
+func TestS3_CopyObject_URLEncodedSource(t *testing.T) {
+	client := newS3Client(t)
+	ctx := t.Context()
+	bucketName := "test-copy-encoded-source-bucket"
+
+	_, err := client.CreateBucket(ctx, &s3.CreateBucketInput{
+		Bucket: aws.String(bucketName),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(bucketName),
+		Key:    aws.String("dir/source.txt"),
+		Body:   bytes.NewReader([]byte("encoded copy")),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// url.PathEscape encodes '/' as %2F so the entire path becomes
+	// percent-encoded — this is the form that previously failed.
+	encoded := url.PathEscape(bucketName + "/dir/source.txt")
+
+	_, err = client.CopyObject(ctx, &s3.CopyObjectInput{
+		Bucket:     aws.String(bucketName),
+		Key:        aws.String("dir/dest.txt"),
+		CopySource: aws.String(encoded),
+	})
+	if err != nil {
+		t.Fatalf("CopyObject with URL-encoded source should succeed: %v", err)
+	}
+
+	got, err := client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(bucketName),
+		Key:    aws.String("dir/dest.txt"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer got.Body.Close()
+
+	body, err := io.ReadAll(got.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(body) != "encoded copy" {
+		t.Errorf("unexpected body: got=%q want=%q", string(body), "encoded copy")
+	}
 }
 
 func TestS3_PutAndGetObjectTagging(t *testing.T) {
