@@ -321,16 +321,18 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// {apiId}.execute-api.<host>/{stage}/{path}. Dispatch to the service
 	// that owns apiID (API Gateway v1 or v2).
 	if apiID, ok := extractExecuteAPIHost(req.Host); ok {
-		for _, h := range r.executeAPIHandlers {
-			if h(w, req, apiID, req.URL.Path) {
-				return
-			}
-		}
+		r.dispatchExecuteAPI(w, req, apiID, req.URL.Path)
 
-		// No service owns this API id: real API Gateway answers 403.
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusForbidden)
-		_, _ = w.Write([]byte(`{"message":"Forbidden"}`))
+		return
+	}
+
+	// Path-style execute-api: LocalStack's edge URL form
+	// /_aws/execute-api/{apiId}/{stage}/{path}. Handled here, before the
+	// prefix routers, because /_aws is a registered prefix (for /_aws/ses)
+	// and would otherwise shadow this. The e2e example scripts and the
+	// terraform `api_invoke_url` output both use this form.
+	if apiID, invokePath, ok := extractExecuteAPIPath(req.URL.Path); ok {
+		r.dispatchExecuteAPI(w, req, apiID, invokePath)
 
 		return
 	}
@@ -425,6 +427,46 @@ func extractExecuteAPIHost(host string) (string, bool) {
 	}
 
 	return "", false
+}
+
+// executeAPIPathPrefix is LocalStack's path-style execute-api edge prefix.
+const executeAPIPathPrefix = "/_aws/execute-api/"
+
+// extractExecuteAPIPath recognises the path-style execute-api invoke URL
+// /_aws/execute-api/{apiId}/{stage}/{path} and returns the API id and the
+// invoke path "/{stage}/{path}" (the form HandleExecuteAPI expects). The
+// remainder after the api id is the invoke path; a request with only the api
+// id yields "/" so the resolver answers Missing Authentication Token.
+func extractExecuteAPIPath(path string) (string, string, bool) {
+	if !strings.HasPrefix(path, executeAPIPathPrefix) {
+		return "", "", false
+	}
+
+	apiID, after, found := strings.Cut(strings.TrimPrefix(path, executeAPIPathPrefix), "/")
+	if apiID == "" {
+		return "", "", false
+	}
+
+	if !found {
+		return apiID, "/", true
+	}
+
+	return apiID, "/" + after, true
+}
+
+// dispatchExecuteAPI routes a deployed-API invocation to the service that owns
+// apiID (API Gateway v1 or v2). invokePath is "/{stage}/{path}". When no
+// registered handler owns the id, real API Gateway answers 403.
+func (r *Router) dispatchExecuteAPI(w http.ResponseWriter, req *http.Request, apiID, invokePath string) {
+	for _, h := range r.executeAPIHandlers {
+		if h(w, req, apiID, invokePath) {
+			return
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusForbidden)
+	_, _ = w.Write([]byte(`{"message":"Forbidden"}`))
 }
 
 // extractBucketFromHost recognises AWS S3 virtual-hosted-style hosts

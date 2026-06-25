@@ -246,3 +246,62 @@ func TestRouter_LocalStackHealthFallback(t *testing.T) {
 		t.Errorf("services: got %v, want empty", resp.Services)
 	}
 }
+
+// TestRouter_ExecuteAPIPathStyle verifies the LocalStack path-style invoke URL
+// /_aws/execute-api/{apiId}/{stage}/{path} reaches the execute-api dispatch with
+// the api id split off and the remainder passed as the "/{stage}/{path}" invoke
+// path. The e2e example scripts use this form.
+func TestRouter_ExecuteAPIPathStyle(t *testing.T) {
+	t.Parallel()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	r := NewRouter(logger)
+
+	gotAPIID := ""
+	gotInvokePath := ""
+
+	r.AddExecuteAPIHandler(func(w http.ResponseWriter, _ *http.Request, apiID, invokePath string) bool {
+		gotAPIID = apiID
+		gotInvokePath = invokePath
+
+		w.WriteHeader(http.StatusOK)
+
+		return true
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/_aws/execute-api/abc123-0/local/programs/CARD_MANAGEMENT", http.NoBody)
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", rec.Code)
+	}
+
+	if gotAPIID != "abc123-0" {
+		t.Errorf("apiID: got %q, want abc123-0", gotAPIID)
+	}
+
+	if gotInvokePath != "/local/programs/CARD_MANAGEMENT" {
+		t.Errorf("invokePath: got %q, want /local/programs/CARD_MANAGEMENT", gotInvokePath)
+	}
+}
+
+// TestRouter_ExecuteAPIPathStyleUnowned asserts that when no registered handler
+// owns the api id, the path-style invoke answers 403 (real API Gateway behavior),
+// mirroring the virtual-hosted branch.
+func TestRouter_ExecuteAPIPathStyleUnowned(t *testing.T) {
+	t.Parallel()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	r := NewRouter(logger)
+
+	r.AddExecuteAPIHandler(func(http.ResponseWriter, *http.Request, string, string) bool { return false })
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/_aws/execute-api/zzz/local/x", http.NoBody)
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status: got %d, want 403", rec.Code)
+	}
+}
