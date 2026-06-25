@@ -14,6 +14,13 @@ import (
 	"github.com/sivchari/kumo/internal/storage"
 )
 
+// S3Putter is the minimal S3 write surface the delivery loop needs. It is
+// satisfied by an adapter installed via SetS3Putter in cross-service wiring,
+// avoiding a direct dependency on the s3 package (and an import cycle).
+type S3Putter interface {
+	PutObject(ctx context.Context, bucket, key string, data []byte, contentType string) error
+}
+
 // Storage defines the interface for Firehose storage operations.
 type Storage interface {
 	CreateDeliveryStream(ctx context.Context, input *CreateDeliveryStreamInput) (*DeliveryStream, error)
@@ -49,6 +56,13 @@ type MemoryStorage struct {
 	mu      sync.RWMutex           `json:"-"`
 	Streams map[string]*StreamData `json:"streams"`
 	dataDir string
+
+	// s3Putter is the installed S3 delivery target (nil until wiring runs).
+	s3Putter S3Putter
+	// flushCtx scopes the background flush loop; cancelled by Close.
+	flushCtx    context.Context //nolint:containedctx // intentional: scopes the background flush goroutine to storage lifetime
+	flushCancel context.CancelFunc
+	flushOnce   sync.Once
 }
 
 // StreamData holds a delivery stream and its records.
@@ -56,6 +70,12 @@ type StreamData struct {
 	Stream  *DeliveryStream   `json:"stream"`
 	Records []StoredRecord    `json:"records"`
 	Tags    map[string]string `json:"tags,omitempty"`
+	// DeliveredCount is the number of leading Records already written to S3
+	// (a high-water mark). Persisted so a restart does not re-deliver.
+	DeliveredCount int `json:"deliveredCount,omitempty"`
+	// DeliveryVersion is the 1-based object version embedded in the S3 key,
+	// incremented per delivered object.
+	DeliveryVersion int `json:"deliveryVersion,omitempty"`
 }
 
 // StoredRecord holds a stored record.
@@ -67,8 +87,12 @@ type StoredRecord struct {
 
 // NewMemoryStorage creates a new MemoryStorage.
 func NewMemoryStorage(opts ...Option) *MemoryStorage {
+	ctx, cancel := context.WithCancel(context.Background())
+
 	s := &MemoryStorage{
-		Streams: make(map[string]*StreamData),
+		Streams:     make(map[string]*StreamData),
+		flushCtx:    ctx,
+		flushCancel: cancel,
 	}
 	for _, o := range opts {
 		o(s)
@@ -125,8 +149,16 @@ func (s *MemoryStorage) saveLocked() {
 	storage.ScheduleSave(s.dataDir, "firehose", s.MarshalJSON)
 }
 
-// Close saves the storage state to disk if persistence is enabled.
+// Close stops the background flush loop, performs a final synchronous flush of
+// any buffered records to S3, then saves the storage state to disk if
+// persistence is enabled.
 func (s *MemoryStorage) Close() error {
+	if s.flushCancel != nil {
+		s.flushCancel()
+	}
+
+	s.flushAll(true)
+
 	if s.dataDir == "" {
 		return nil
 	}

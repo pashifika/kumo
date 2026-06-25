@@ -82,6 +82,7 @@ type Server struct {
 	cborDispatcher  *CBORProtocolDispatcher
 	logger          *slog.Logger
 	server          *http.Server
+	capturer        *managementEventCapturer
 }
 
 // New creates a new server with the given configuration.
@@ -105,6 +106,7 @@ func New(config Config) *Server {
 		queryDispatcher: queryDispatcher,
 		cborDispatcher:  cborDispatcher,
 		logger:          logger,
+		capturer:        newManagementEventCapturer(),
 	}
 
 	// Auto-register services from global registry
@@ -117,6 +119,9 @@ func New(config Config) *Server {
 	wireS3toSQS(registry)
 	wireCloudWatchToSNS(registry)
 	wireAPIGatewayToLambda(registry)
+	wireFirehoseToS3(registry)
+	wirePipesToEventBridge(registry)
+	wireCloudTrailToS3(registry)
 
 	// Feed the registered service names into the LocalStack-compatible health
 	// endpoint. Sorted so the response is deterministic across restarts.
@@ -151,12 +156,14 @@ func (s *Server) unifiedDispatcher(w http.ResponseWriter, r *http.Request) {
 	// Query protocol uses form-urlencoded.
 	if mediaType == "application/x-www-form-urlencoded" {
 		s.queryDispatcher.ServeHTTP(w, r)
+		s.capturer.record(r, true)
 
 		return
 	}
 
 	// Default to JSON protocol.
 	s.jsonDispatcher.ServeHTTP(w, r)
+	s.capturer.record(r, false)
 }
 
 // Registry returns the service registry.

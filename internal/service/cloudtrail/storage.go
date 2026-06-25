@@ -10,8 +10,15 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sivchari/kumo/internal/cloudtrailevents"
 	"github.com/sivchari/kumo/internal/storage"
 )
+
+// deliveryAccountID is the account embedded in delivered S3 object keys. It is
+// the emulator-wide account (matching the rest of kumo and the audit-worm
+// bucket policy), independent of the cosmetic defaultAccountID used in trail
+// ARNs.
+const deliveryAccountID = "000000000000"
 
 // Error codes.
 const (
@@ -64,6 +71,16 @@ type MemoryStorage struct {
 	region    string
 	accountID string
 	dataDir   string
+
+	// s3Putter is the installed S3 log delivery target (nil until wiring runs).
+	s3Putter S3Putter
+	// markerWritten records trails whose 0-byte AWSLogs marker object has
+	// already been written (in-memory; re-writing on restart is harmless).
+	markerWritten map[string]bool
+	// flushCtx scopes the background delivery loop; cancelled by Close.
+	flushCtx    context.Context //nolint:containedctx // intentional: scopes the background delivery goroutine to storage lifetime
+	flushCancel context.CancelFunc
+	flushOnce   sync.Once
 }
 
 // NewMemoryStorage creates a new MemoryStorage.
@@ -73,10 +90,15 @@ func NewMemoryStorage(opts ...Option) *MemoryStorage {
 		region = defaultRegion
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+
 	s := &MemoryStorage{
-		Trails:    make(map[string]*Trail),
-		region:    region,
-		accountID: defaultAccountID,
+		Trails:        make(map[string]*Trail),
+		region:        region,
+		accountID:     defaultAccountID,
+		markerWritten: make(map[string]bool),
+		flushCtx:      ctx,
+		flushCancel:   cancel,
 	}
 	for _, o := range opts {
 		o(s)
@@ -133,8 +155,13 @@ func (m *MemoryStorage) saveLocked() {
 	storage.ScheduleSave(m.dataDir, "cloudtrail", m.MarshalJSON)
 }
 
-// Close saves the storage state to disk if persistence is enabled.
+// Close stops the background delivery loop, then saves the storage state to
+// disk if persistence is enabled.
 func (m *MemoryStorage) Close() error {
+	if m.flushCancel != nil {
+		m.flushCancel()
+	}
+
 	if m.dataDir == "" {
 		return nil
 	}
@@ -283,6 +310,7 @@ func (m *MemoryStorage) StartLogging(_ context.Context, name string) error {
 	trail.IsLogging = true
 
 	m.saveLocked()
+	m.refreshLoggingLocked()
 
 	return nil
 }
@@ -302,8 +330,23 @@ func (m *MemoryStorage) StopLogging(_ context.Context, name string) error {
 	trail.IsLogging = false
 
 	m.saveLocked()
+	m.refreshLoggingLocked()
 
 	return nil
+}
+
+// refreshLoggingLocked updates the shared CloudTrail sink so it records API
+// calls only while at least one trail is logging. Must hold m.mu.
+func (m *MemoryStorage) refreshLoggingLocked() {
+	for _, t := range m.Trails {
+		if t.IsLogging {
+			cloudtrailevents.Global.SetLogging(true)
+
+			return
+		}
+	}
+
+	cloudtrailevents.Global.SetLogging(false)
 }
 
 // LookupEvents looks up events.
