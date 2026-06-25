@@ -114,6 +114,7 @@ func New(config Config) *Server {
 	wireSNStoSQS(registry)
 	wireS3toSQS(registry)
 	wireCloudWatchToSNS(registry)
+	wireAPIGatewayToLambda(registry)
 
 	// Register unified protocol dispatcher for POST /
 	hasJSONServices := len(jsonDispatcher.handlers) > 0

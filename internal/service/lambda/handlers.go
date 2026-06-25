@@ -451,6 +451,66 @@ func (s *Service) invokeSync(ctx context.Context, w http.ResponseWriter, endpoin
 	}
 }
 
+// InvokeSync invokes function fn synchronously and returns its response
+// payload. It exists for in-process, service-to-service calls — such as the
+// API Gateway REQUEST authorizer step — that need the function's result
+// without going through the HTTP invoke handler.
+//
+// The resolution order mirrors Invoke: a handler polling the Runtime API wins,
+// then a configured InvokeEndpoint, otherwise there is no execution backend and
+// an error is returned. A Runtime API handler that signals a function error
+// still has its payload returned (the error envelope), leaving interpretation
+// to the caller; only transport-level failures surface as a Go error.
+func (s *Service) InvokeSync(ctx context.Context, fn string, payload []byte) ([]byte, error) {
+	f, err := s.storage.GetFunction(ctx, fn)
+	if err != nil {
+		return nil, fmt.Errorf("get function %s: %w", fn, err)
+	}
+
+	switch {
+	case s.broker.registered(fn):
+		res, err := s.broker.invoke(ctx, fn, payload, false)
+		if err != nil {
+			return nil, fmt.Errorf("runtime invoke %s: %w", fn, err)
+		}
+
+		return res.payload, nil
+	case f.InvokeEndpoint != "":
+		return s.invokeEndpointSync(ctx, f.InvokeEndpoint, payload)
+	default:
+		return nil, fmt.Errorf("function %s has no runtime handler or InvokeEndpoint", fn)
+	}
+}
+
+// invokeEndpointSync POSTs payload to a function's configured InvokeEndpoint and
+// returns the response body. A non-2xx status is treated as a failed invocation.
+func (s *Service) invokeEndpointSync(ctx context.Context, endpoint string, payload []byte) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return nil, fmt.Errorf("build invoke request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("invoke endpoint: %w", err)
+	}
+
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read invoke response: %w", err)
+	}
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("invoke endpoint returned status %d", resp.StatusCode)
+	}
+
+	return body, nil
+}
+
 // extractFunctionName extracts function name from URL paths like:
 //
 //   - /lambda/2015-03-31/functions/{name}              (SDK BaseEndpoint = .../lambda)
