@@ -641,6 +641,19 @@ func TestGetIdentitySource(t *testing.T) {
 				if resp.PrincipalEntityType != "Issuer::User" {
 					t.Errorf("principalEntityType: got %q, want Issuer::User", resp.PrincipalEntityType)
 				}
+
+				if resp.Configuration == nil || resp.Configuration.CognitoUserPoolConfiguration == nil {
+					t.Fatal("configuration.cognitoUserPoolConfiguration: missing")
+				}
+
+				cfg := resp.Configuration.CognitoUserPoolConfiguration
+				if cfg.UserPoolARN != "arn:aws:cognito-idp:us-east-1:000000000000:userpool/us-east-1_abc" {
+					t.Errorf("userPoolArn: got %q", cfg.UserPoolARN)
+				}
+
+				if len(cfg.ClientIDs) != 1 || cfg.ClientIDs[0] != "client-1" {
+					t.Errorf("clientIds: got %v, want [client-1]", cfg.ClientIDs)
+				}
 			},
 		},
 		{
