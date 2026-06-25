@@ -34,8 +34,9 @@ const (
 // emulator launches the function itself. Enabled via KUMO_LAMBDA_EXECUTOR=process.
 type processExecutor struct {
 	broker         *runtimeBroker
-	runtimeAPIHost string // host:port of kumo's Runtime API, e.g. "127.0.0.1:4566"
-	workDir        string // base dir for extracted bootstraps
+	runtimeAPIHost string        // host:port of kumo's Runtime API, e.g. "127.0.0.1:4566"
+	workDir        string        // base dir for extracted bootstraps
+	startGrace     time.Duration // window after launch to catch an immediate exit
 
 	// ctx bounds the lifetime of every launched bootstrap; cancel (on close)
 	// tears them all down.
@@ -60,6 +61,7 @@ func newProcessExecutor(broker *runtimeBroker, runtimeAPIHost string) *processEx
 		broker:         broker,
 		runtimeAPIHost: runtimeAPIHost,
 		workDir:        filepath.Join(os.TempDir(), "kumo-lambda"),
+		startGrace:     processStartGrace,
 		ctx:            ctx,
 		cancel:         cancel,
 		procs:          make(map[string]*managedProc),
@@ -123,7 +125,7 @@ func (e *processExecutor) ensureRunning(fn *Function) error {
 	select {
 	case <-done:
 		return fmt.Errorf("bootstrap for %s exited immediately", fn.FunctionName)
-	case <-time.After(processStartGrace):
+	case <-time.After(e.startGrace):
 		return nil
 	}
 }

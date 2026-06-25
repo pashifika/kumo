@@ -102,6 +102,168 @@ func TestProcessExecutor_BuildEnv(t *testing.T) {
 	}
 }
 
+// TestProcessExecutor_ExtractBootstrapErrors covers extractBootstrap's failure
+// paths: an unreadable zip, a zip missing the bootstrap entry, and a work dir
+// that cannot be created.
+func TestProcessExecutor_ExtractBootstrapErrors(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name           string
+		fn             *Function
+		badWorkDir     bool
+		bootstrapIsDir bool
+	}{
+		{"invalid zip", &Function{FunctionName: "bad", Code: &FunctionCode{ZipFile: []byte("not a zip")}}, false, false},
+		{"no bootstrap entry", &Function{FunctionName: "noboot", Code: &FunctionCode{ZipFile: zipBytes(t, "index.js", []byte("x"))}}, false, false},
+		{"unwritable work dir", &Function{FunctionName: "wd", Code: &FunctionCode{ZipFile: zipBytes(t, bootstrapEntry, []byte("x"))}}, true, false},
+		{"bootstrap path is a directory", &Function{FunctionName: "dirboot", Code: &FunctionCode{ZipFile: zipBytes(t, bootstrapEntry, []byte("x"))}}, false, true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newProcessExecutor(newRuntimeBroker(), "127.0.0.1:4566")
+			e.workDir = t.TempDir()
+
+			if tc.badWorkDir {
+				// A file where extractBootstrap expects to mkdir a subdirectory.
+				e.workDir = filepath.Join(t.TempDir(), "afile")
+				if err := os.WriteFile(e.workDir, []byte("x"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			if tc.bootstrapIsDir {
+				// A directory where writeBootstrap expects to create the file.
+				if err := os.MkdirAll(filepath.Join(e.workDir, tc.fn.FunctionName, bootstrapEntry), 0o750); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			if _, err := e.extractBootstrap(tc.fn); err == nil {
+				t.Errorf("extractBootstrap(%s): expected error, got nil", tc.name)
+			}
+		})
+	}
+}
+
+// TestProcessExecutor_EnsureRunningStartError verifies ensureRunning surfaces a
+// launch failure when the extracted bootstrap is not an executable program.
+func TestProcessExecutor_EnsureRunningStartError(t *testing.T) {
+	t.Parallel()
+
+	e := newProcessExecutor(newRuntimeBroker(), "127.0.0.1:4566")
+	e.workDir = t.TempDir()
+	t.Cleanup(e.close)
+
+	// A bootstrap with the executable bit but no shebang / valid binary format:
+	// execve returns ENOEXEC and cmd.Start fails (Go does not fall back to sh).
+	fn := &Function{
+		FunctionName: "notexec",
+		Runtime:      "provided.al2023",
+		Code:         &FunctionCode{ZipFile: zipBytes(t, bootstrapEntry, []byte("not an executable program"))},
+	}
+
+	if err := e.ensureRunning(fn); err == nil {
+		t.Fatal("ensureRunning: expected a start error for a non-executable bootstrap")
+	}
+}
+
+// TestProcessExecutor_EnsureRunningImmediateExit verifies a bootstrap that exits
+// at once is reported as a failed start rather than left to the broker timeout.
+func TestProcessExecutor_EnsureRunningImmediateExit(t *testing.T) {
+	t.Parallel()
+
+	e := newProcessExecutor(newRuntimeBroker(), "127.0.0.1:4566")
+	e.workDir = t.TempDir()
+	// Generous grace so the exit is detected deterministically even under -race.
+	e.startGrace = 5 * time.Second
+	t.Cleanup(e.close)
+
+	fn := &Function{
+		FunctionName: "exitfn",
+		Runtime:      "provided.al2023",
+		Code:         &FunctionCode{ZipFile: scriptBootstrapZip(t, "exit 0")},
+	}
+
+	if err := e.ensureRunning(fn); err == nil {
+		t.Fatal("ensureRunning: expected error for an immediately-exiting bootstrap")
+	}
+}
+
+// TestProcessExecutor_EnsureRunningWarmReuse verifies a second invoke reuses the
+// warm process instead of relaunching it.
+func TestProcessExecutor_EnsureRunningWarmReuse(t *testing.T) {
+	t.Parallel()
+
+	e := newProcessExecutor(newRuntimeBroker(), "127.0.0.1:4566")
+	e.workDir = t.TempDir()
+	e.startGrace = 50 * time.Millisecond // the sleep outlives it, so launch returns promptly
+	t.Cleanup(e.close)
+
+	fn := &Function{
+		FunctionName: "warmfn",
+		Runtime:      "provided.al2023",
+		Code:         &FunctionCode{ZipFile: scriptBootstrapZip(t, "exec sleep 30")},
+	}
+
+	if err := e.ensureRunning(fn); err != nil {
+		t.Fatalf("ensureRunning (cold): %v", err)
+	}
+
+	first := runningPID(t, e, "warmfn")
+
+	if err := e.ensureRunning(fn); err != nil {
+		t.Fatalf("ensureRunning (warm): %v", err)
+	}
+
+	if second := runningPID(t, e, "warmfn"); second != first {
+		t.Errorf("warm reuse: pid changed %d -> %d (process relaunched)", first, second)
+	}
+}
+
+// TestProcessExecutor_Stop verifies stop kills the process, removes its entry,
+// and drops the broker registration; stopping an unknown function is a no-op.
+func TestProcessExecutor_Stop(t *testing.T) {
+	t.Parallel()
+
+	broker := newRuntimeBroker()
+	e := newProcessExecutor(broker, "127.0.0.1:4566")
+	e.workDir = t.TempDir()
+	e.startGrace = 50 * time.Millisecond // the sleep outlives it, so launch returns promptly
+	t.Cleanup(e.close)
+
+	fn := &Function{
+		FunctionName: "stopfn",
+		Runtime:      "provided.al2023",
+		Code:         &FunctionCode{ZipFile: scriptBootstrapZip(t, "exec sleep 30")},
+	}
+
+	if err := e.ensureRunning(fn); err != nil {
+		t.Fatalf("ensureRunning: %v", err)
+	}
+
+	// Simulate the bootstrap having registered with the broker.
+	_ = broker.get("stopfn")
+
+	e.stop("stopfn")
+
+	if broker.registered("stopfn") {
+		t.Errorf("stop did not deregister the function")
+	}
+
+	e.mu.Lock()
+	_, exists := e.procs["stopfn"]
+	e.mu.Unlock()
+
+	if exists {
+		t.Errorf("stop did not remove the process entry")
+	}
+
+	// Stopping an unknown function must not panic.
+	e.stop("does-not-exist")
+}
+
 // TestProcessExecutor_InvokeRunsBootstrap exercises the full executor path: a
 // real bootstrap (a stdlib Runtime API client) is built, zipped, registered as a
 // function, and invoked. kumo launches it via the process executor, the bootstrap
@@ -257,4 +419,28 @@ func envMap(kv []string) map[string]string {
 	}
 
 	return m
+}
+
+// scriptBootstrapZip zips a /bin/sh script as the "bootstrap" entry, letting the
+// executor's process paths be exercised without compiling a Go binary.
+func scriptBootstrapZip(t *testing.T, script string) []byte {
+	t.Helper()
+
+	return zipBytes(t, bootstrapEntry, []byte("#!/bin/sh\n"+script+"\n"))
+}
+
+// runningPID returns the OS pid of a function's launched process, failing if no
+// live process is recorded.
+func runningPID(t *testing.T, e *processExecutor, fn string) int {
+	t.Helper()
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	mp := e.procs[fn]
+	if mp == nil || mp.cmd.Process == nil {
+		t.Fatalf("no running process for %s", fn)
+	}
+
+	return mp.cmd.Process.Pid
 }
