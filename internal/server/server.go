@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -27,6 +28,7 @@ type Config struct {
 	Port     int
 	LogLevel slog.Level
 	InitDir  string // Directory containing init scripts to execute on startup
+	Version  string // kumo version, reported by the LocalStack-compatible /_localstack/health endpoint
 }
 
 // DefaultConfig returns the default server configuration.
@@ -115,6 +117,12 @@ func New(config Config) *Server {
 	wireS3toSQS(registry)
 	wireCloudWatchToSNS(registry)
 	wireAPIGatewayToLambda(registry)
+
+	// Feed the registered service names into the LocalStack-compatible health
+	// endpoint. Sorted so the response is deterministic across restarts.
+	healthServices := registry.Names()
+	sort.Strings(healthServices)
+	router.SetLocalStackHealth(healthServices, config.Version)
 
 	// Register unified protocol dispatcher for POST /
 	hasJSONServices := len(jsonDispatcher.handlers) > 0

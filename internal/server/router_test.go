@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -165,5 +166,83 @@ func TestExtractRoutePrefix_BoundaryGuard(t *testing.T) {
 				t.Errorf("extractRoutePrefix(%q) = %q, want %q", tc.pattern, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestRouter_LocalStackHealth verifies the LocalStack-compatible health endpoint
+// reports every registered service as "available" so LocalStack tooling (e.g.
+// the example verify.sh, which curl -sf's /_localstack/health) works
+// against kumo unchanged.
+func TestRouter_LocalStackHealth(t *testing.T) {
+	t.Parallel()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	r := NewRouter(logger)
+
+	svcs := []string{"cognito-idp", "dynamodb", "lambda"}
+	r.SetLocalStackHealth(svcs, "9.9.9")
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/_localstack/health", http.NoBody))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type: got %q, want application/json", ct)
+	}
+
+	var resp struct {
+		Services map[string]string `json:"services"`
+		Edition  string            `json:"edition"`
+		Version  string            `json:"version"`
+	}
+
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal body %q: %v", rec.Body.String(), err)
+	}
+
+	for _, svc := range svcs {
+		if resp.Services[svc] != localStackServiceStatus {
+			t.Errorf("services[%q]: got %q, want %q", svc, resp.Services[svc], localStackServiceStatus)
+		}
+	}
+
+	if resp.Edition != localStackEdition {
+		t.Errorf("edition: got %q, want %q", resp.Edition, localStackEdition)
+	}
+
+	if resp.Version != "9.9.9" {
+		t.Errorf("version: got %q, want 9.9.9", resp.Version)
+	}
+}
+
+// TestRouter_LocalStackHealthFallback covers a Router with no service list wired
+// in (e.g. built directly in a test): the endpoint must still answer 200 with
+// valid JSON rather than an empty body.
+func TestRouter_LocalStackHealthFallback(t *testing.T) {
+	t.Parallel()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	r := NewRouter(logger)
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/_localstack/health", http.NoBody))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", rec.Code)
+	}
+
+	var resp struct {
+		Services map[string]string `json:"services"`
+	}
+
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal fallback body %q: %v", rec.Body.String(), err)
+	}
+
+	if len(resp.Services) != 0 {
+		t.Errorf("services: got %v, want empty", resp.Services)
 	}
 }

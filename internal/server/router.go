@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -14,6 +15,20 @@ import (
 
 // localhostHost is the loopback host label used by kumo virtual-hosted URLs.
 const localhostHost = "localhost"
+
+const (
+	// localStackEdition mirrors the "edition" field LocalStack reports in its
+	// health response. kumo is the open-source-equivalent surface, so "community".
+	localStackEdition = "community"
+	// localStackServiceStatus is the per-service status reported by the health
+	// endpoint. Every registered service is always reachable in kumo, so all
+	// services report "available" (LocalStack's ready state).
+	localStackServiceStatus = "available"
+)
+
+// localStackHealthFallback is served when no service list has been wired in
+// (e.g. a Router built directly in a test); keeps the endpoint valid JSON.
+var localStackHealthFallback = []byte(`{"services":{},"edition":"community"}`)
 
 // Route represents a registered HTTP route.
 type Route struct {
@@ -42,6 +57,10 @@ type Router struct {
 	wellKnownMux       *http.ServeMux            // Dedicated mux for /{id}/.well-known/jwks.json
 	executeAPIHandlers []executeAPIDispatch
 	logger             *slog.Logger
+
+	// localstackHealthBody is the pre-rendered JSON for the LocalStack-compatible
+	// /_localstack/health endpoint, built once after service registration.
+	localstackHealthBody []byte
 }
 
 // AddExecuteAPIHandler registers a handler for virtual-hosted execute-api
@@ -60,6 +79,38 @@ func NewRouter(logger *slog.Logger) *Router {
 	}
 
 	return r
+}
+
+// SetLocalStackHealth pre-renders the /_localstack/health response body from the
+// registered service names. kumo is a LocalStack-compatible emulator, so tooling
+// that probes LocalStack's health endpoint (e.g. the example verify.sh)
+// works unchanged. Each service maps to "available"; version echoes the kumo
+// build version. The body is rendered once because the service set is fixed
+// after registration.
+func (r *Router) SetLocalStackHealth(services []string, version string) {
+	resp := struct {
+		Services map[string]string `json:"services"`
+		Edition  string            `json:"edition"`
+		Version  string            `json:"version"`
+	}{
+		Services: make(map[string]string, len(services)),
+		Edition:  localStackEdition,
+		Version:  version,
+	}
+
+	for _, name := range services {
+		resp.Services[name] = localStackServiceStatus
+	}
+
+	body, err := json.Marshal(resp)
+	if err != nil {
+		// Unreachable: the response holds only strings. Keep the endpoint valid.
+		r.localstackHealthBody = localStackHealthFallback
+
+		return
+	}
+
+	r.localstackHealthBody = body
 }
 
 // Handle registers a handler for the given method and pattern.
@@ -223,13 +274,37 @@ func (r *Router) wrapHandler(method, pattern string, handler http.HandlerFunc) h
 }
 
 // ServeHTTP implements http.Handler.
-func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	// Handle health endpoint before ServeMux to avoid route conflicts.
-	if req.URL.Path == "/health" {
+// serveHealth answers kumo's native /health probe and the LocalStack-compatible
+// /_localstack/health endpoint. It returns true when the request was a health
+// probe and a response has already been written, so ServeHTTP can stop.
+func (r *Router) serveHealth(w http.ResponseWriter, req *http.Request) bool {
+	switch req.URL.Path {
+	case "/health":
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"healthy"}`))
 
+		return true
+	case "/_localstack/health":
+		body := r.localstackHealthBody
+		if body == nil {
+			body = localStackHealthFallback
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+
+		return true
+	default:
+		return false
+	}
+}
+
+func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	// Health probes are answered before ServeMux to avoid colliding with S3's
+	// catch-all wildcard routes (/health and /_localstack are not service prefixes).
+	if r.serveHealth(w, req) {
 		return
 	}
 
